@@ -27,8 +27,8 @@ app = FastAPI(
     version     = "1.0.0"
 )
 
-logging_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-logging.basicConfig(level=logging_level)
+configured_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=configured_log_level)
 logger = logging.getLogger("tvet-assessment")
 
 ALLOWED_ORIGINS = [
@@ -45,10 +45,22 @@ app.add_middleware(
     allow_headers     = ["Authorization", "Content-Type"],
 )
 
-RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
-RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+def _read_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning("invalid_int_env var=%s value=%s fallback=%s", name, raw_value, default)
+        return default
+
+
+RATE_LIMIT_REQUESTS = _read_int_env("RATE_LIMIT_REQUESTS", 120)
+RATE_LIMIT_WINDOW_SECONDS = _read_int_env("RATE_LIMIT_WINDOW_SECONDS", 60)
 _rate_limit_store = defaultdict(deque)
 _rate_limit_lock = Lock()
+
+if os.getenv("UVICORN_WORKERS", "1") != "1":
+    logger.warning("in_memory_rate_limit_is_worker_local workers=%s", os.getenv("UVICORN_WORKERS"))
 
 
 @app.middleware("http")
