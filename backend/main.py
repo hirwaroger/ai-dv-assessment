@@ -38,9 +38,6 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-if "*" in ALLOWED_ORIGINS:
-    raise RuntimeError("ALLOWED_ORIGINS cannot contain '*' when credentials are enabled")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ALLOWED_ORIGINS,
@@ -58,6 +55,9 @@ def _read_int_env(name: str, default: int) -> int:
         return default
 
 
+AMBIGUOUS_MARKERS = ("etc", "and so on", "maybe", "possibly")
+MIN_OPEN_RUBRIC_LENGTH = _read_int_env("MIN_OPEN_RUBRIC_LENGTH", 25)
+MAX_VALIDATION_ERRORS = _read_int_env("MAX_VALIDATION_ERRORS", 20)
 RATE_LIMIT_REQUESTS = _read_int_env("RATE_LIMIT_REQUESTS", 120)
 RATE_LIMIT_WINDOW_SECONDS = _read_int_env("RATE_LIMIT_WINDOW_SECONDS", 60)
 _rate_limit_store = defaultdict(deque)
@@ -113,8 +113,6 @@ def _validate_generated_questions(questions: list[dict], selected_outcomes: list
     allowed_bloom = {"remember", "understand", "apply", "analyze", "evaluate", "create"}
     allowed_types = {"mcq", "true_false", "matching", "open"}
     selected_outcomes_set = {o.strip().lower() for o in selected_outcomes}
-    ambiguous_markers = ("etc", "and so on", "maybe", "possibly")
-
     seen_questions = set()
     errors = []
     for index, q in enumerate(questions, start=1):
@@ -132,7 +130,7 @@ def _validate_generated_questions(questions: list[dict], selected_outcomes: list
             errors.append(f"Q{index}: invalid Bloom level '{bloom_level}'")
         if question_type not in allowed_types:
             errors.append(f"Q{index}: invalid question type '{question_type}'")
-        if any(marker in question_text.lower() for marker in ambiguous_markers):
+        if any(marker in question_text.lower() for marker in AMBIGUOUS_MARKERS):
             errors.append(f"Q{index}: question contains ambiguous wording")
 
         normalized = _normalize_question_text(question_text)
@@ -141,11 +139,16 @@ def _validate_generated_questions(questions: list[dict], selected_outcomes: list
         else:
             seen_questions.add(normalized)
 
-        if question_type == "open" and len(rubric_text) < 25:
+        if question_type == "open" and len(rubric_text) < MIN_OPEN_RUBRIC_LENGTH:
             errors.append(f"Q{index}: rubric/model answer is incomplete")
 
     if errors:
-        raise HTTPException(status_code=422, detail={"message": "Generated exam validation failed", "errors": errors[:20]})
+        total_errors = len(errors)
+        visible_errors = errors[:MAX_VALIDATION_ERRORS]
+        detail = {"message": "Generated exam validation failed", "errors": visible_errors}
+        if total_errors > MAX_VALIDATION_ERRORS:
+            detail["note"] = f"Showing first {MAX_VALIDATION_ERRORS} of {total_errors} validation errors"
+        raise HTTPException(status_code=422, detail=detail)
 
 # ═══════════════════════════════════════════════════════════════════════
 # GLOBAL STORES
@@ -534,6 +537,8 @@ MANUAL_REGISTRY = {
 # ═══════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 def startup():
+    if "*" in ALLOWED_ORIGINS:
+        raise RuntimeError("ALLOWED_ORIGINS must not contain '*' - specify explicit origins when allow_credentials is True")
     create_tables()
     for module_key, info in MANUAL_REGISTRY.items():
         load_manual(info["json"], info["desc_map"], module_key)
