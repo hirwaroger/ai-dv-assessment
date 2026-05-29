@@ -29,6 +29,7 @@ class Teacher(Base):
 
 class Exam(Base):
     __tablename__ = "exams"
+    __table_args__  = (Index("ix_exams_teacher_created", "teacher_id", "created_at"),)
     id              = Column(Integer, primary_key=True, index=True)
     teacher_id      = Column(Integer, ForeignKey("teachers.id"))
     program         = Column(String(100))
@@ -48,6 +49,7 @@ class Exam(Base):
 
 class Question(Base):
     __tablename__ = "questions"
+    __table_args__  = (Index("ix_questions_exam_number", "exam_id", "number"),)
     id              = Column(Integer, primary_key=True, index=True)
     exam_id         = Column(Integer, ForeignKey("exams.id"))
     number          = Column(Integer)
@@ -79,11 +81,6 @@ class QuestionBank(Base):
     topic           = Column(String(200))
     times_used      = Column(Integer, default=0)
     created_at      = Column(DateTime, default=datetime.utcnow)
-
-
-Index("ix_exams_teacher_created", Exam.teacher_id, Exam.created_at)
-Index("ix_questions_exam_number", Question.exam_id, Question.number)
-
 
 def get_db():
     db = SessionLocal()

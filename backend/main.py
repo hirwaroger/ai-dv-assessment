@@ -8,6 +8,7 @@ import pandas as pd
 import json, os, re, random, sys
 import logging
 import time
+from threading import Lock
 from collections import defaultdict, deque
 
 from database import get_db, create_tables, Exam, Question, QuestionBank, Teacher
@@ -38,7 +39,7 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ALLOWED_ORIGINS,
-    allow_credentials = False,
+    allow_credentials = True,
     allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers     = ["Authorization", "Content-Type"],
 )
@@ -46,19 +47,25 @@ app.add_middleware(
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 _rate_limit_store = defaultdict(deque)
+_rate_limit_lock = Lock()
 
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    client_ip = request.client.host if request.client else "unknown"
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
     now = time.time()
-    request_log = _rate_limit_store[client_ip]
-    while request_log and request_log[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
-        request_log.popleft()
-    if len(request_log) >= RATE_LIMIT_REQUESTS:
-        logger.warning("rate_limit_exceeded ip=%s path=%s", client_ip, request.url.path)
-        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
-    request_log.append(now)
+    with _rate_limit_lock:
+        request_log = _rate_limit_store[client_ip]
+        while request_log and request_log[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
+            request_log.popleft()
+        if len(request_log) >= RATE_LIMIT_REQUESTS:
+            logger.warning("rate_limit_exceeded ip=%s path=%s", client_ip, request.url.path)
+            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+        request_log.append(now)
 
     teacher_email = None
     auth_header = request.headers.get("authorization")
