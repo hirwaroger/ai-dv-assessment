@@ -8,6 +8,7 @@ import pandas as pd
 import json, os, re, random, sys
 import logging
 import time
+import uuid
 from threading import Lock
 from collections import defaultdict, deque
 
@@ -36,6 +37,9 @@ ALLOWED_ORIGINS = [
     for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
     if origin.strip()
 ]
+
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError("ALLOWED_ORIGINS cannot contain '*' when credentials are enabled")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,16 +74,6 @@ async def security_middleware(request: Request, call_next):
         client_ip = forwarded_for.split(",")[0].strip()
     else:
         client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    with _rate_limit_lock:
-        request_log = _rate_limit_store[client_ip]
-        while request_log and request_log[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
-            request_log.popleft()
-        if len(request_log) >= RATE_LIMIT_REQUESTS:
-            logger.warning("rate_limit_exceeded ip=%s path=%s", client_ip, request.url.path)
-            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
-        request_log.append(now)
-
     teacher_email = None
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.lower().startswith("bearer "):
@@ -90,12 +84,68 @@ async def security_middleware(request: Request, call_next):
         except JWTError:
             teacher_email = None
 
+    limiter_identity = teacher_email or client_ip
+    now = time.time()
+    with _rate_limit_lock:
+        request_log = _rate_limit_store[limiter_identity]
+        while request_log and request_log[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
+            request_log.popleft()
+        if len(request_log) >= RATE_LIMIT_REQUESTS:
+            logger.warning("rate_limit_exceeded identity=%s path=%s", limiter_identity, request.url.path)
+            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+        request_log.append(now)
+
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     response = await call_next(request)
+    response.headers["x-request-id"] = request_id
     logger.info(
-        "audit method=%s path=%s status=%s ip=%s teacher=%s",
-        request.method, request.url.path, response.status_code, client_ip, teacher_email or "anonymous"
+        "audit request_id=%s method=%s path=%s status=%s ip=%s teacher=%s",
+        request_id, request.method, request.url.path, response.status_code, client_ip, teacher_email or "anonymous"
     )
     return response
+
+
+def _normalize_question_text(question: str) -> str:
+    return re.sub(r"\s+", " ", (question or "").strip().lower())
+
+
+def _validate_generated_questions(questions: list[dict], selected_outcomes: list[str]) -> None:
+    allowed_bloom = {"remember", "understand", "apply", "analyze", "evaluate", "create"}
+    allowed_types = {"mcq", "true_false", "matching", "open"}
+    selected_outcomes_set = {o.strip().lower() for o in selected_outcomes}
+    ambiguous_markers = ("etc", "and so on", "maybe", "possibly")
+
+    seen_questions = set()
+    errors = []
+    for index, q in enumerate(questions, start=1):
+        question_text = str(q.get("question", "")).strip()
+        learning_outcome = str(q.get("learning_outcome", "")).strip().lower()
+        bloom_level = str(q.get("bloom_level", "")).strip().lower()
+        question_type = str(q.get("question_type", "")).strip().lower()
+        rubric_text = str(q.get("correct_answer", "")).strip()
+
+        if not question_text:
+            errors.append(f"Q{index}: question text is empty")
+        if learning_outcome not in selected_outcomes_set:
+            errors.append(f"Q{index}: learning outcome is not aligned with requested curriculum outcomes")
+        if bloom_level not in allowed_bloom:
+            errors.append(f"Q{index}: invalid Bloom level '{bloom_level}'")
+        if question_type not in allowed_types:
+            errors.append(f"Q{index}: invalid question type '{question_type}'")
+        if any(marker in question_text.lower() for marker in ambiguous_markers):
+            errors.append(f"Q{index}: question contains ambiguous wording")
+
+        normalized = _normalize_question_text(question_text)
+        if normalized in seen_questions:
+            errors.append(f"Q{index}: duplicate question detected")
+        else:
+            seen_questions.add(normalized)
+
+        if question_type == "open" and len(rubric_text) < 25:
+            errors.append(f"Q{index}: rubric/model answer is incomplete")
+
+    if errors:
+        raise HTTPException(status_code=422, detail={"message": "Generated exam validation failed", "errors": errors[:20]})
 
 # ═══════════════════════════════════════════════════════════════════════
 # GLOBAL STORES
@@ -686,6 +736,7 @@ def generate_exam(
 
         all_questions.extend(qs)
 
+    _validate_generated_questions(all_questions, selected_outcomes)
     all_questions = scale_marks_to_total(all_questions, request.total_marks)
     df_exam       = pd.DataFrame(all_questions)
 
@@ -773,7 +824,12 @@ def download_exam_pdf(
     teacher: Teacher = Depends(get_current_teacher),
 ):
     exam      = db.query(Exam).filter(Exam.id == exam_id, Exam.teacher_id == teacher.id).first()
-    questions = db.query(Question).filter(Question.exam_id == exam_id).all()
+    questions = (
+        db.query(Question)
+        .join(Exam, Exam.id == Question.exam_id)
+        .filter(Question.exam_id == exam_id, Exam.teacher_id == teacher.id)
+        .all()
+    )
     if not exam or not questions:
         raise HTTPException(404, "Exam not found")
 
@@ -862,7 +918,12 @@ def download_marking_guide(
     teacher: Teacher = Depends(get_current_teacher),
 ):
     exam      = db.query(Exam).filter(Exam.id == exam_id, Exam.teacher_id == teacher.id).first()
-    questions = db.query(Question).filter(Question.exam_id == exam_id).all()
+    questions = (
+        db.query(Question)
+        .join(Exam, Exam.id == Question.exam_id)
+        .filter(Question.exam_id == exam_id, Exam.teacher_id == teacher.id)
+        .all()
+    )
     if not exam or not questions:
         raise HTTPException(404, "Exam not found")
 
