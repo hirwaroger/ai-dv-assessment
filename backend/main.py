@@ -442,18 +442,6 @@ MANUAL_REGISTRY = {
         "program" : "SOFTWARE DEVELOPMENT",
         "level"   : 3,
     },
-    "Backend Application Development Using Node JS": {
-        "json"    : "manual_node.json",
-        "desc_map": "desc_map_node.json",
-        "outcomes": [
-            "Develop RESTFUL APIs with Node JS",
-            "Secure Backend Application",
-            "Test Backend Application",
-            "Manage Backend Application",
-        ],
-        "program" : "SOFTWARE DEVELOPMENT",
-        "level"   : 4,
-    },
     "Fundamental of Blockchain Application": {
         "json"    : "manual_blockchain.json",
         "desc_map": "desc_map_blockchain.json",

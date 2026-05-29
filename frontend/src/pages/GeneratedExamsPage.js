@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import SectionCard from "../components/SectionCard";
-import { getMyExams, deleteExam, downloadExamPDF, downloadMarkingGuide } from "../services/api";
+import { getMyExams, updateExam, deleteExam, downloadExamPDF, downloadMarkingGuide } from "../services/api";
 
 function GeneratedExamsPage() {
   const navigate = useNavigate();
