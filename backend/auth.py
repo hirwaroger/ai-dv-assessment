@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 from database import get_db, Teacher
 import os
 
-SECRET_KEY   = os.getenv("SECRET_KEY", "tvet-secret-key-change-in-production")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required")
 ALGORITHM    = "HS256"
 TOKEN_EXPIRE = 60 * 24  # 24 hours
 

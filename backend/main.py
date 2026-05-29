@@ -1,10 +1,16 @@
 from generator import generate_exam_questions, scale_marks_to_total
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from jose import JWTError, jwt
 import pandas as pd
 import json, os, re, random, sys
+import logging
+import time
+import uuid
+from threading import Lock
+from collections import defaultdict, deque
 
 from database import get_db, create_tables, Exam, Question, QuestionBank, Teacher
 from schemas import (
@@ -12,7 +18,7 @@ from schemas import (
     TeacherLogin, TokenResponse, ModuleInfo, QuestionBankItem,
     ExamUpdateRequest, QuestionUpdateRequest, NewQuestionRequest
 )
-from auth     import hash_password, verify_password, create_token, get_current_teacher
+from auth     import hash_password, verify_password, create_token, get_current_teacher, SECRET_KEY, ALGORITHM
 
 sys.path.append(os.getenv("MODEL_PATH", "../"))
 
@@ -22,13 +28,127 @@ app = FastAPI(
     version     = "1.0.0"
 )
 
+configured_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=configured_log_level)
+logger = logging.getLogger("tvet-assessment")
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["*"],
+    allow_origins     = ALLOWED_ORIGINS,
     allow_credentials = True,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
+    allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers     = ["Authorization", "Content-Type"],
 )
+
+def _read_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning("invalid_int_env var=%s value=%s fallback=%s", name, raw_value, default)
+        return default
+
+
+AMBIGUOUS_MARKERS = ("etc", "and so on", "maybe", "possibly")
+MIN_OPEN_RUBRIC_LENGTH = _read_int_env("MIN_OPEN_RUBRIC_LENGTH", 25)
+MAX_VALIDATION_ERRORS = _read_int_env("MAX_VALIDATION_ERRORS", 20)
+RATE_LIMIT_REQUESTS = _read_int_env("RATE_LIMIT_REQUESTS", 120)
+RATE_LIMIT_WINDOW_SECONDS = _read_int_env("RATE_LIMIT_WINDOW_SECONDS", 60)
+_rate_limit_store = defaultdict(deque)
+_rate_limit_lock = Lock()
+
+if os.getenv("UVICORN_WORKERS", "1") != "1":
+    logger.warning("in_memory_rate_limit_is_worker_local workers=%s", os.getenv("UVICORN_WORKERS"))
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+    teacher_email = None
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            teacher_email = payload.get("sub")
+        except JWTError:
+            teacher_email = None
+
+    limiter_identity = teacher_email or client_ip
+    now = time.time()
+    with _rate_limit_lock:
+        request_log = _rate_limit_store[limiter_identity]
+        while request_log and request_log[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
+            request_log.popleft()
+        if len(request_log) >= RATE_LIMIT_REQUESTS:
+            logger.warning("rate_limit_exceeded identity=%s path=%s", limiter_identity, request.url.path)
+            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+        request_log.append(now)
+
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["x-request-id"] = request_id
+    logger.info(
+        "audit request_id=%s method=%s path=%s status=%s ip=%s teacher=%s",
+        request_id, request.method, request.url.path, response.status_code, client_ip, teacher_email or "anonymous"
+    )
+    return response
+
+
+def _normalize_question_text(question: str) -> str:
+    return re.sub(r"\s+", " ", (question or "").strip().lower())
+
+
+def _validate_generated_questions(questions: list[dict], selected_outcomes: list[str]) -> None:
+    allowed_bloom = {"remember", "understand", "apply", "analyze", "evaluate", "create"}
+    allowed_types = {"mcq", "true_false", "matching", "open"}
+    selected_outcomes_set = {o.strip().lower() for o in selected_outcomes}
+    seen_questions = set()
+    errors = []
+    for index, q in enumerate(questions, start=1):
+        question_text = str(q.get("question", "")).strip()
+        learning_outcome = str(q.get("learning_outcome", "")).strip().lower()
+        bloom_level = str(q.get("bloom_level", "")).strip().lower()
+        question_type = str(q.get("question_type", "")).strip().lower()
+        rubric_text = str(q.get("correct_answer", "")).strip()
+
+        if not question_text:
+            errors.append(f"Q{index}: question text is empty")
+        if learning_outcome not in selected_outcomes_set:
+            errors.append(f"Q{index}: learning outcome is not aligned with requested curriculum outcomes")
+        if bloom_level not in allowed_bloom:
+            errors.append(f"Q{index}: invalid Bloom level '{bloom_level}'")
+        if question_type not in allowed_types:
+            errors.append(f"Q{index}: invalid question type '{question_type}'")
+        if any(marker in question_text.lower() for marker in AMBIGUOUS_MARKERS):
+            errors.append(f"Q{index}: question contains ambiguous wording")
+
+        normalized = _normalize_question_text(question_text)
+        if normalized in seen_questions:
+            errors.append(f"Q{index}: duplicate question detected")
+        else:
+            seen_questions.add(normalized)
+
+        if question_type == "open" and len(rubric_text) < MIN_OPEN_RUBRIC_LENGTH:
+            errors.append(f"Q{index}: rubric/model answer is incomplete")
+
+    if errors:
+        total_errors = len(errors)
+        visible_errors = errors[:MAX_VALIDATION_ERRORS]
+        detail = {"message": "Generated exam validation failed", "errors": visible_errors}
+        if total_errors > MAX_VALIDATION_ERRORS:
+            detail["note"] = f"Showing first {MAX_VALIDATION_ERRORS} of {total_errors} validation errors"
+        raise HTTPException(status_code=422, detail=detail)
 
 # ═══════════════════════════════════════════════════════════════════════
 # GLOBAL STORES
@@ -375,18 +495,6 @@ MANUAL_REGISTRY = {
         "program" : "SOFTWARE DEVELOPMENT",
         "level"   : 3,
     },
-    "Backend Application Development Using Node JS": {
-        "json"    : "manual_node.json",
-        "desc_map": "desc_map_node.json",
-        "outcomes": [
-            "Develop RESTFUL APIs with Node JS",
-            "Secure Backend Application",
-            "Test Backend Application",
-            "Manage Backend Application",
-        ],
-        "program" : "SOFTWARE DEVELOPMENT",
-        "level"   : 4,
-    },
     "Fundamental of Blockchain Application": {
         "json"    : "manual_blockchain.json",
         "desc_map": "desc_map_blockchain.json",
@@ -429,6 +537,8 @@ MANUAL_REGISTRY = {
 # ═══════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 def startup():
+    if "*" in ALLOWED_ORIGINS:
+        raise RuntimeError("ALLOWED_ORIGINS must not contain '*' - specify explicit origins when allow_credentials is True")
     create_tables()
     for module_key, info in MANUAL_REGISTRY.items():
         load_manual(info["json"], info["desc_map"], module_key)
@@ -631,6 +741,7 @@ def generate_exam(
 
         all_questions.extend(qs)
 
+    _validate_generated_questions(all_questions, selected_outcomes)
     all_questions = scale_marks_to_total(all_questions, request.total_marks)
     df_exam       = pd.DataFrame(all_questions)
 
@@ -667,6 +778,7 @@ def generate_exam(
         db.add(q)
 
         bank_q = QuestionBank(
+            teacher_id      = teacher.id,
             program         = request.program,
             level           = request.level,
             module          = request.module,
@@ -716,8 +828,13 @@ def download_exam_pdf(
     db     : Session = Depends(get_db),
     teacher: Teacher = Depends(get_current_teacher),
 ):
-    exam      = db.query(Exam).filter(Exam.id == exam_id).first()
-    questions = db.query(Question).filter(Question.exam_id == exam_id).all()
+    exam      = db.query(Exam).filter(Exam.id == exam_id, Exam.teacher_id == teacher.id).first()
+    questions = (
+        db.query(Question)
+        .join(Exam, Exam.id == Question.exam_id)
+        .filter(Question.exam_id == exam_id, Exam.teacher_id == teacher.id)
+        .all()
+    )
     if not exam or not questions:
         raise HTTPException(404, "Exam not found")
 
@@ -805,8 +922,13 @@ def download_marking_guide(
     db     : Session = Depends(get_db),
     teacher: Teacher = Depends(get_current_teacher),
 ):
-    exam      = db.query(Exam).filter(Exam.id == exam_id).first()
-    questions = db.query(Question).filter(Question.exam_id == exam_id).all()
+    exam      = db.query(Exam).filter(Exam.id == exam_id, Exam.teacher_id == teacher.id).first()
+    questions = (
+        db.query(Question)
+        .join(Exam, Exam.id == Question.exam_id)
+        .filter(Question.exam_id == exam_id, Exam.teacher_id == teacher.id)
+        .all()
+    )
     if not exam or not questions:
         raise HTTPException(404, "Exam not found")
 
@@ -858,7 +980,7 @@ def get_question_bank(
     db     : Session = Depends(get_db),
     teacher: Teacher = Depends(get_current_teacher),
 ):
-    query = db.query(QuestionBank)
+    query = db.query(QuestionBank).filter(QuestionBank.teacher_id == teacher.id)
     if module: query = query.filter(QuestionBank.module.ilike(f"%{module}%"))
     if level : query = query.filter(QuestionBank.level == level)
     if qtype : query = query.filter(QuestionBank.question_type == qtype)
