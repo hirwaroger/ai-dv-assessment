@@ -27,7 +27,8 @@ app = FastAPI(
     version     = "1.0.0"
 )
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=logging_level)
 logger = logging.getLogger("tvet-assessment")
 
 ALLOWED_ORIGINS = [
