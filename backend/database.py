@@ -1,13 +1,15 @@
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+import os
 from datetime import datetime
-import os
+
 from dotenv import load_dotenv
-import os
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:lea123@localhost:5432/tvet_db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is required")
 
 engine       = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -63,6 +65,7 @@ class Question(Base):
 class QuestionBank(Base):
     __tablename__ = "question_bank"
     id              = Column(Integer, primary_key=True, index=True)
+    teacher_id      = Column(Integer, ForeignKey("teachers.id"), index=True)
     program         = Column(String(100))
     level           = Column(Integer)
     module          = Column(String(200))
@@ -76,6 +79,10 @@ class QuestionBank(Base):
     topic           = Column(String(200))
     times_used      = Column(Integer, default=0)
     created_at      = Column(DateTime, default=datetime.utcnow)
+
+
+Index("ix_exams_teacher_created", Exam.teacher_id, Exam.created_at)
+Index("ix_questions_exam_number", Question.exam_id, Question.number)
 
 
 def get_db():

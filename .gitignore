@@ -1,0 +1,5 @@
+backend/.env
+backend/__pycache__/
+backend/*.pdf
+backend/temp_exam_*.csv
+frontend/node_modules/

@@ -1,10 +1,14 @@
 from generator import generate_exam_questions, scale_marks_to_total
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from jose import JWTError, jwt
 import pandas as pd
 import json, os, re, random, sys
+import logging
+import time
+from collections import defaultdict, deque
 
 from database import get_db, create_tables, Exam, Question, QuestionBank, Teacher
 from schemas import (
@@ -12,7 +16,7 @@ from schemas import (
     TeacherLogin, TokenResponse, ModuleInfo, QuestionBankItem,
     ExamUpdateRequest, QuestionUpdateRequest, NewQuestionRequest
 )
-from auth     import hash_password, verify_password, create_token, get_current_teacher
+from auth     import hash_password, verify_password, create_token, get_current_teacher, SECRET_KEY, ALGORITHM
 
 sys.path.append(os.getenv("MODEL_PATH", "../"))
 
@@ -22,13 +26,56 @@ app = FastAPI(
     version     = "1.0.0"
 )
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("tvet-assessment")
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["*"],
-    allow_credentials = True,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
+    allow_origins     = ALLOWED_ORIGINS,
+    allow_credentials = False,
+    allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers     = ["Authorization", "Content-Type"],
 )
+
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+_rate_limit_store = defaultdict(deque)
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    request_log = _rate_limit_store[client_ip]
+    while request_log and request_log[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
+        request_log.popleft()
+    if len(request_log) >= RATE_LIMIT_REQUESTS:
+        logger.warning("rate_limit_exceeded ip=%s path=%s", client_ip, request.url.path)
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+    request_log.append(now)
+
+    teacher_email = None
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            teacher_email = payload.get("sub")
+        except JWTError:
+            teacher_email = None
+
+    response = await call_next(request)
+    logger.info(
+        "audit method=%s path=%s status=%s ip=%s teacher=%s",
+        request.method, request.url.path, response.status_code, client_ip, teacher_email or "anonymous"
+    )
+    return response
 
 # ═══════════════════════════════════════════════════════════════════════
 # GLOBAL STORES
@@ -667,6 +714,7 @@ def generate_exam(
         db.add(q)
 
         bank_q = QuestionBank(
+            teacher_id      = teacher.id,
             program         = request.program,
             level           = request.level,
             module          = request.module,
@@ -716,7 +764,7 @@ def download_exam_pdf(
     db     : Session = Depends(get_db),
     teacher: Teacher = Depends(get_current_teacher),
 ):
-    exam      = db.query(Exam).filter(Exam.id == exam_id).first()
+    exam      = db.query(Exam).filter(Exam.id == exam_id, Exam.teacher_id == teacher.id).first()
     questions = db.query(Question).filter(Question.exam_id == exam_id).all()
     if not exam or not questions:
         raise HTTPException(404, "Exam not found")
@@ -805,7 +853,7 @@ def download_marking_guide(
     db     : Session = Depends(get_db),
     teacher: Teacher = Depends(get_current_teacher),
 ):
-    exam      = db.query(Exam).filter(Exam.id == exam_id).first()
+    exam      = db.query(Exam).filter(Exam.id == exam_id, Exam.teacher_id == teacher.id).first()
     questions = db.query(Question).filter(Question.exam_id == exam_id).all()
     if not exam or not questions:
         raise HTTPException(404, "Exam not found")
@@ -858,7 +906,7 @@ def get_question_bank(
     db     : Session = Depends(get_db),
     teacher: Teacher = Depends(get_current_teacher),
 ):
-    query = db.query(QuestionBank)
+    query = db.query(QuestionBank).filter(QuestionBank.teacher_id == teacher.id)
     if module: query = query.filter(QuestionBank.module.ilike(f"%{module}%"))
     if level : query = query.filter(QuestionBank.level == level)
     if qtype : query = query.filter(QuestionBank.question_type == qtype)
